@@ -42,6 +42,20 @@ error_set! {
     }
 }
 ```
+
+Include a standalone unit error in a set with `||`. The set gets a unit variant with the same
+name, and `.into()` converts the standalone value to that variant:
+```rust
+error_set! {
+    #[display("stream ended before a complete record was read")]
+    IncompleteRecord
+
+    ReaderError := { InvalidEncoding } || IncompleteRecord
+}
+
+let error: ReaderError = IncompleteRecord.into();
+assert!(matches!(error, ReaderError::IncompleteRecord));
+```
 <details>
 
   <summary>Cargo Expand</summary>

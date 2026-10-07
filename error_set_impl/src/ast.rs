@@ -46,11 +46,45 @@ pub(crate) enum AstErrorKind {
 impl Parse for AstErrorKind {
     fn parse(input: ParseStream) -> Result<Self> {
         let fork = input.fork();
-        let _ = fork.call(Attribute::parse_outer);
+        let _ = fork.call(Attribute::parse_outer)?;
         let _ = fork.parse::<Visibility>();
         if fork.peek(syn::Token![struct]) {
             let error_struct = input.parse::<AstErrorStruct>()?;
             return Ok(AstErrorKind::Struct(error_struct));
+        }
+        let has_enum_keyword = fork.peek(syn::Token![enum]);
+        if !has_enum_keyword && fork.is_empty() {
+            let enum_decl = input.parse::<AstErrorEnumDeclaration>()?;
+            return Ok(AstErrorKind::Enum(enum_decl));
+        }
+        if has_enum_keyword {
+            fork.parse::<syn::Token![enum]>()?;
+        }
+        let _ = fork.parse::<Ident>()?;
+        // A name followed by `:=` (or `{`, to preserve the existing diagnostic for
+        // ordinary enum syntax) is an error set. A bare name declares a unit error.
+        let is_error_set = has_enum_keyword
+            || fork.peek(syn::Token![:])
+            || fork.peek(syn::token::Brace)
+            || fork.peek(syn::Token![<]);
+        if !is_error_set {
+            let mut attributes = input.call(Attribute::parse_outer)?;
+            let vis = if input.peek(syn::Token![pub]) {
+                input.parse::<Visibility>()?
+            } else {
+                Visibility::Public(Pub { span: input.span() })
+            };
+            let name = input.parse::<Ident>()?;
+            let item_struct: ItemStruct = syn::parse_quote! {
+                #(#attributes)* #vis struct #name;
+            };
+            let display = extract_display_attribute(&mut attributes)?;
+            let mut item_struct = item_struct;
+            item_struct.attrs = attributes;
+            return Ok(AstErrorKind::Struct(AstErrorStruct {
+                r#struct: item_struct,
+                display,
+            }));
         }
         let enum_decl = input.parse::<AstErrorEnumDeclaration>()?;
         return Ok(AstErrorKind::Enum(enum_decl));

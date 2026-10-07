@@ -26,7 +26,7 @@ pub fn error_set(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
             }
         }
     }
-    let error_enums = match resolve(error_enum_decls) {
+    let error_enums = match resolve(error_enum_decls, &error_struct_decls) {
         Ok(ok) => ok,
         Err(err) => {
             return err.into_compile_error().into();

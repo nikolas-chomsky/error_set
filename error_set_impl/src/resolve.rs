@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    AstErrorEnumDeclaration, AstErrorVariant, AstInlineErrorVariantField, Disabled, RefError,
+    AstErrorEnumDeclaration, AstErrorStruct, AstErrorVariant, AstInlineErrorVariantField, Disabled,
+    RefError,
 };
 use crate::expand::{ErrorEnum, ErrorVariant, Named, SourceStruct, SourceTuple, Struct};
 
@@ -12,6 +13,7 @@ use syn::{Attribute, Ident, TypeParam, Visibility};
 /// all error sets with the full expansion.
 pub(crate) fn resolve(
     error_enum_decls: Vec<AstErrorEnumDeclaration>,
+    error_structs: &[AstErrorStruct],
 ) -> syn::Result<Vec<ErrorEnum>> {
     let mut error_enum_builders: Vec<ErrorEnumBuilder> = Vec::new();
 
@@ -42,15 +44,23 @@ pub(crate) fn resolve(
         }
         error_enum_builders.push(error_enum_builder);
     }
-    let error_enums = resolve_builders(error_enum_builders)?;
+    let error_enums = resolve_builders(error_enum_builders, error_structs)?;
 
     Ok(error_enums)
 }
 
-fn resolve_builders(mut error_enum_builders: Vec<ErrorEnumBuilder>) -> syn::Result<Vec<ErrorEnum>> {
+fn resolve_builders(
+    mut error_enum_builders: Vec<ErrorEnumBuilder>,
+    error_structs: &[AstErrorStruct],
+) -> syn::Result<Vec<ErrorEnum>> {
     for index in 0..error_enum_builders.len() {
         if !error_enum_builders[index].ref_parts_to_resolve.is_empty() {
-            resolve_builders_helper(index, &mut *error_enum_builders, &mut Vec::new())?;
+            resolve_builders_helper(
+                index,
+                &mut *error_enum_builders,
+                error_structs,
+                &mut Vec::new(),
+            )?;
         }
     }
     let error_enums = error_enum_builders
@@ -63,6 +73,7 @@ fn resolve_builders(mut error_enum_builders: Vec<ErrorEnumBuilder>) -> syn::Resu
 fn resolve_builders_helper<'a>(
     index: usize,
     error_enum_builders: &'a mut [ErrorEnumBuilder],
+    error_structs: &[AstErrorStruct],
     visited: &mut Vec<Ident>,
 ) -> syn::Result<Vec<AstErrorVariant>> {
     //println!("visited `{}`", visited.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" - "));
@@ -95,10 +106,64 @@ fn resolve_builders_helper<'a>(
             let ref_error_enum_index = match ref_error_enum_index {
                 Some(e) => e,
                 None => {
-                    return Err(syn::parse::Error::new_spanned(
-                        &ref_part.name,
-                        "Not a declared error set.",
-                    ));
+                    let standalone_error = error_structs.iter().find(|error_struct| {
+                        error_struct.r#struct.ident == ref_part.name
+                            && error_struct.r#struct.generics.params.is_empty()
+                            && matches!(&error_struct.r#struct.fields, syn::Fields::Unit)
+                    });
+                    let Some(standalone_error) = standalone_error else {
+                        return Err(syn::parse::Error::new_spanned(
+                            &ref_part.name,
+                            "Not a declared error set.",
+                        ));
+                    };
+                    if !ref_part.generic_refs.is_empty() {
+                        return Err(syn::parse::Error::new_spanned(
+                            &ref_part.name,
+                            "Standalone unit errors do not take generic arguments.",
+                        ));
+                    }
+                    let cfg_attributes = standalone_error
+                        .r#struct
+                        .attrs
+                        .iter()
+                        .filter(|attribute| {
+                            attribute
+                                .path()
+                                .get_ident()
+                                .is_some_and(|ident| ident == "cfg")
+                        })
+                        .cloned()
+                        .collect();
+                    let standalone_variant = AstErrorVariant {
+                        attributes: Vec::new(),
+                        cfg_attributes,
+                        display: standalone_error.display.clone(),
+                        name: standalone_error.r#struct.ident.clone(),
+                        fields: None,
+                        source_type: None,
+                    };
+                    let error_set_name = error_enum_builders[index].error_name.clone();
+                    let variants = &mut error_enum_builders[index].error_variants;
+                    if variants.iter().any(|variant| {
+                        does_occupy_the_same_space(variant, &standalone_variant)
+                    }) {
+                        return Err(syn::parse::Error::new_spanned(
+                            &ref_part.name,
+                            format!(
+                                "Error '{0}' is already defined in error set '{1}'.",
+                                ref_part.name, error_set_name
+                            ),
+                        ));
+                    }
+                    variants.push(standalone_variant);
+                    let standalone_error_name = standalone_error.r#struct.ident.clone();
+                    let included_standalone_errors =
+                        &mut error_enum_builders[index].standalone_errors;
+                    if !included_standalone_errors.contains(&standalone_error_name) {
+                        included_standalone_errors.push(standalone_error_name);
+                    }
+                    continue;
                 }
             };
             if !error_enum_builders[ref_error_enum_index]
@@ -106,12 +171,40 @@ fn resolve_builders_helper<'a>(
                 .is_empty()
             {
                 visited.push(error_enum_builders[index].error_name.clone());
-                resolve_builders_helper(ref_error_enum_index, error_enum_builders, visited)?;
+                resolve_builders_helper(
+                    ref_error_enum_index,
+                    error_enum_builders,
+                    error_structs,
+                    visited,
+                )?;
                 visited.pop();
             }
             let [this_error_enum_builder, ref_error_enum_builder] = error_enum_builders
                 .get_disjoint_mut([index, ref_error_enum_index])
                 .unwrap();
+            for standalone_error in &ref_error_enum_builder.standalone_errors {
+                if this_error_enum_builder
+                    .error_variants
+                    .iter()
+                    .any(|variant| &variant.name == standalone_error)
+                {
+                    return Err(syn::parse::Error::new_spanned(
+                        standalone_error,
+                        format!(
+                            "Error '{0}' is already defined in error set '{1}'.",
+                            standalone_error, this_error_enum_builder.error_name
+                        ),
+                    ));
+                }
+                if !this_error_enum_builder
+                    .standalone_errors
+                    .contains(standalone_error)
+                {
+                    this_error_enum_builder
+                        .standalone_errors
+                        .push(standalone_error.clone());
+                }
+            }
             // Let the ref declaration override the original generic declaration name to avoid collisions - `.. || X<T> ..`
             if ref_part.generic_refs.len() != ref_error_enum_builder.generics.len() {
                 Err(syn::parse::Error::new_spanned(
@@ -242,6 +335,7 @@ struct ErrorEnumBuilder {
     pub generics: Vec<TypeParam>,
     pub disabled: Disabled,
     pub error_variants: Vec<AstErrorVariant>,
+    pub standalone_errors: Vec<Ident>,
     /// Once this is empty, all [ref_parts] have been resolved and [error_variants] is complete.
     pub ref_parts_to_resolve: Vec<RefError>,
 }
@@ -261,6 +355,7 @@ impl ErrorEnumBuilder {
             generics,
             disabled,
             error_variants: Vec::new(),
+            standalone_errors: Vec::new(),
             ref_parts_to_resolve: Vec::new(),
         }
     }
@@ -287,6 +382,7 @@ impl From<ErrorEnumBuilder> for ErrorEnum {
                 .into_iter()
                 .map(|v| reshape(v))
                 .collect::<Vec<_>>(),
+            standalone_errors: value.standalone_errors,
         }
     }
 }

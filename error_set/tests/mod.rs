@@ -34,6 +34,43 @@ pub mod regular {
 }
 
 #[cfg(test)]
+pub mod standalone_unit_errors {
+    use error_set::error_set;
+
+    error_set! {
+        #[display("record ended before all fields were read")]
+        TruncatedRecord
+
+        #[derive(PartialEq)]
+        DecodeError := { InvalidText } || TruncatedRecord
+
+        #[derive(PartialEq)]
+        ImportError := { InvalidMetadata } || DecodeError
+    }
+
+    #[test]
+    fn standalone_errors_are_unit_variants_and_convert_through_sets() {
+        assert_eq!(
+            TruncatedRecord.to_string(),
+            "record ended before all fields were read"
+        );
+
+        let decode_error: DecodeError = TruncatedRecord.into();
+        assert_eq!(decode_error, DecodeError::TruncatedRecord);
+        assert_eq!(
+            decode_error.to_string(),
+            "record ended before all fields were read"
+        );
+
+        let import_error: ImportError = decode_error.into();
+        assert_eq!(import_error, ImportError::TruncatedRecord);
+
+        let import_error: ImportError = TruncatedRecord.into();
+        assert_eq!(import_error, ImportError::TruncatedRecord);
+    }
+}
+
+#[cfg(test)]
 pub mod empty_set {
     use error_set::error_set;
 

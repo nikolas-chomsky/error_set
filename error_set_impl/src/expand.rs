@@ -55,7 +55,7 @@ pub(crate) fn expand(
     }
 
     for error_enum_node in graph.iter() {
-        add_code_for_node(error_enum_node, &*graph, &mut token_stream);
+        add_code_for_node(error_enum_node, &*graph, &error_structs, &mut token_stream);
     }
     for error_struct in error_structs {
         add_struct_error(error_struct, &mut token_stream);
@@ -75,6 +75,15 @@ fn add_struct_error(error_struct: AstErrorStruct, token_stream: &mut TokenStream
         semi_token,
     } = &r#struct;
     let (impl_generics, ty_generics, where_generics) = &generics.split_for_impl();
+    let cfg_attributes = attrs
+        .iter()
+        .filter(|attribute| {
+            attribute
+                .path()
+                .get_ident()
+                .is_some_and(|ident| ident == "cfg")
+        })
+        .collect::<Vec<_>>();
     let debug = quote! { #[derive(Debug)] };
     token_stream.append_all(quote! {
         #(#attrs)*
@@ -95,6 +104,7 @@ fn add_struct_error(error_struct: AstErrorStruct, token_stream: &mut TokenStream
     }
     if has_source_field {
         token_stream.append_all(quote! {
+            #(#cfg_attributes)*
             #[allow(unused_qualifications)]
             impl #impl_generics core::error::Error for #struct_name #ty_generics {
                 fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
@@ -104,6 +114,7 @@ fn add_struct_error(error_struct: AstErrorStruct, token_stream: &mut TokenStream
         });
     } else {
         token_stream.append_all(quote! {
+            #(#cfg_attributes)*
             impl #impl_generics core::error::Error for #struct_name #ty_generics {
 
             }
@@ -112,6 +123,13 @@ fn add_struct_error(error_struct: AstErrorStruct, token_stream: &mut TokenStream
 
     if let Some(display) = display {
         let field_names = fields.iter().filter_map(|e| e.ident.as_ref());
+        let display_bindings = if matches!(fields, syn::Fields::Unit) {
+            quote! {}
+        } else {
+            quote! {
+                let #struct_name { #(#field_names),* } = &self;
+            }
+        };
         let tokens = &display.tokens;
         let display_write_tokens: TokenStream;
         // e.g. `opaque` (no point in using this here but keeping functionality is consistent with enum variants)
@@ -138,17 +156,19 @@ fn add_struct_error(error_struct: AstErrorStruct, token_stream: &mut TokenStream
             };
         }
         token_stream.append_all(quote! {
+            #(#cfg_attributes)*
             impl #impl_generics core::fmt::Display for #struct_name #ty_generics {
                 #[allow(unused_qualifications)]
                 #[inline]
                 fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-                    let #struct_name { #(#field_names),* } = &self;
+                    #display_bindings
                     #display_write_tokens
                 }
             }
         });
     } else {
         token_stream.append_all(quote! {
+            #(#cfg_attributes)*
             impl #impl_generics core::fmt::Display for #struct_name #ty_generics {
                 #[inline]
                 fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -162,12 +182,13 @@ fn add_struct_error(error_struct: AstErrorStruct, token_stream: &mut TokenStream
 fn add_code_for_node(
     error_enum_node: &ErrorEnumGraphNode,
     graph: &[ErrorEnumGraphNode],
+    standalone_errors: &[AstErrorStruct],
     token_stream: &mut TokenStream,
 ) {
     add_enum(error_enum_node, token_stream);
     impl_error(error_enum_node, token_stream);
     impl_display(error_enum_node, token_stream);
-    impl_froms(error_enum_node, graph, token_stream);
+    impl_froms(error_enum_node, graph, standalone_errors, token_stream);
 }
 
 fn add_enum(error_enum_node: &ErrorEnumGraphNode, token_stream: &mut TokenStream) {
@@ -422,6 +443,7 @@ fn impl_display(error_enum_node: &ErrorEnumGraphNode, token_stream: &mut TokenSt
 fn impl_froms(
     error_enum_node: &ErrorEnumGraphNode,
     graph: &[ErrorEnumGraphNode],
+    standalone_errors: &[AstErrorStruct],
     token_stream: &mut TokenStream,
 ) {
     let error_enum = &error_enum_node.error_enum;
@@ -639,6 +661,38 @@ fn impl_froms(
                 };
             }
         }
+    }
+
+    // A standalone unit error is represented by a unit variant in each set that
+    // includes it, so converting it does not wrap or retain a payload.
+    for standalone_error in standalone_errors {
+        if !matches!(&standalone_error.r#struct.fields, syn::Fields::Unit) {
+            continue;
+        }
+        let standalone_error_name = &standalone_error.r#struct.ident;
+        if !error_enum.standalone_errors.contains(standalone_error_name) {
+            continue;
+        }
+        if froms_to_disable_idents.contains(&standalone_error_name) {
+            continue;
+        }
+        let Some(error_variant) = error_enum
+            .error_variants
+            .iter()
+            .find(|variant| variant.name() == standalone_error_name)
+        else {
+            continue;
+        };
+        let cfg_attributes = error_variant.cfg_attributes();
+        let (impl_generics, ty_generics) = generic_tokens(&error_enum.generics);
+        token_stream.append_all(quote::quote! {
+            #(#cfg_attributes)*
+            impl #impl_generics From<#standalone_error_name> for #error_enum_name #ty_generics {
+                fn from(_: #standalone_error_name) -> Self {
+                    Self::#standalone_error_name
+                }
+            }
+        });
     }
 }
 //************************************************************************//
@@ -967,6 +1021,7 @@ pub(crate) struct ErrorEnum {
     pub(crate) generics: Vec<TypeParam>,
     pub(crate) disabled: Disabled,
     pub(crate) error_variants: Vec<ErrorVariant>,
+    pub(crate) standalone_errors: Vec<Ident>,
 }
 
 impl core::hash::Hash for ErrorEnum {
