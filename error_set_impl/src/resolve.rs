@@ -144,10 +144,19 @@ fn resolve_builders_helper<'a>(
                         source_type: None,
                     };
                     let error_set_name = error_enum_builders[index].error_name.clone();
+                    let standalone_error_name = standalone_error.r#struct.ident.clone();
+                    let standalone_already_included = error_enum_builders[index]
+                        .standalone_errors
+                        .contains(&standalone_error_name);
                     let variants = &mut error_enum_builders[index].error_variants;
                     if variants.iter().any(|variant| {
                         does_occupy_the_same_space(variant, &standalone_variant)
                     }) {
+                        if standalone_already_included {
+                            // The same standalone error was already included through another
+                            // reference. Set union is idempotent, so keep the existing variant.
+                            continue;
+                        }
                         return Err(syn::parse::Error::new_spanned(
                             &ref_part.name,
                             format!(
@@ -157,7 +166,6 @@ fn resolve_builders_helper<'a>(
                         ));
                     }
                     variants.push(standalone_variant);
-                    let standalone_error_name = standalone_error.r#struct.ident.clone();
                     let included_standalone_errors =
                         &mut error_enum_builders[index].standalone_errors;
                     if !included_standalone_errors.contains(&standalone_error_name) {
@@ -188,6 +196,14 @@ fn resolve_builders_helper<'a>(
                     .iter()
                     .any(|variant| &variant.name == standalone_error)
                 {
+                    if this_error_enum_builder
+                        .standalone_errors
+                        .contains(standalone_error)
+                    {
+                        // This exact standalone error was already brought in by an earlier
+                        // reference; do not report the repeated inclusion as a collision.
+                        continue;
+                    }
                     return Err(syn::parse::Error::new_spanned(
                         standalone_error,
                         format!(
